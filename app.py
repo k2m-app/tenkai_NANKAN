@@ -29,16 +29,16 @@ def login_keibabook(user_id, password):
         if meta_csrf:
             csrf_token = meta_csrf['content']
             
-        # 2. ログイン情報をPOST（※実際のフォームのname属性に合わせて調整が必要な場合があります）
+        # 2. ログイン情報をPOST
         payload = {
             '_token': csrf_token,
-            'login_id': user_id,  # サイトのinput nameに合わせてください
+            'login_id': user_id, 
             'password': password
         }
         
         post_res = session.post(login_page_url, data=payload)
         
-        # ログイン成功判定（マイページへの遷移やエラーメッセージの有無で簡易判定）
+        # ログイン成功判定
         if "ログアウト" in post_res.text or "マイページ" in post_res.text:
             return session, True, "ログインに成功しました。"
         else:
@@ -51,8 +51,6 @@ def login_keibabook(user_id, password):
 # 1. ペース解析・展開予想のコアロジック (南関特化版)
 # ==========================================
 
-# 南関4場の時計の掛かりやすさ補正（基準を船橋=0.0とする）
-# 大井は砂が深く時計が掛かるため、過去の3Fタイムから秒数を引いて（速くして）評価する
 NANKAN_TRACK_BIAS = {
     "大井": 0.5,   
     "船橋": 0.0,   
@@ -67,21 +65,17 @@ def calculate_early_pace_speed(row, current_dist):
     normalized_3f = row['early_3f']
     past_venue = row.get('venue', '')
     
-    # 過去走の競馬場に基づく3Fタイムの標準化
     if past_venue in NANKAN_TRACK_BIAS:
         normalized_3f -= NANKAN_TRACK_BIAS[past_venue]
     elif past_venue not in ["東京", "中山", "京都", "阪神", "中京", "新潟", "福島", "小倉", "札幌", "函館"]:
-        # その他の地方競馬（南関以外）のテン時計割引
         normalized_3f += 0.3 
     
     raw_speed = 600.0 / normalized_3f
 
-    # 馬場状態による補正
     condition_mod = 0.0
     if row['track_condition'] in ["重", "不良"]: condition_mod = -0.15 
     elif row['track_condition'] == "稍": condition_mod = -0.05
 
-    # 距離バイアス補正
     dist_diff = row['distance'] - current_dist
     distance_mod = 0.0
     if dist_diff > 0:
@@ -121,7 +115,6 @@ def calculate_pace_score(horse, current_dist, current_venue, current_track, tota
     if not pd.isna(max_speed):
         speed_advantage = (16.8 - max_speed) * 4.0 
 
-    # 直近のコーナー通過順を重視
     jockey_target = float(past_df.iloc[0]['first_corner_pos']) if not past_df.empty else 7.0
     base_position = (jockey_target * 0.6) + speed_advantage
     
@@ -129,16 +122,11 @@ def calculate_pace_score(horse, current_dist, current_venue, current_track, tota
     horse['special_flag'] = ""
     late_start_penalty = 0.0
     
-    # --------------------------------------------------
-    # 南関特有のコースバイアス・枠順ロジック
-    # --------------------------------------------------
     if current_venue in ["浦和", "川崎"]:
-        # 小回りで直線が短いため、差し・追込馬には厳しいペナルティ
         if horse['running_style'] == "差し追込":
             base_mod += 1.5
             horse['special_flag'] = "⚠️小回り差し厳重注意"
         
-        # 内枠有利・外枠不利の顕著な傾向
         if horse['horse_number'] <= 4:
             base_mod -= 0.5
         elif horse['horse_number'] >= 10:
@@ -146,12 +134,10 @@ def calculate_pace_score(horse, current_dist, current_venue, current_track, tota
             horse['special_flag'] = (horse['special_flag'] + " 📉外枠不利").strip()
             
     elif current_venue == "大井":
-        # 直線が長く差しが届きやすい（ペナルティを軽減）
         if horse['running_style'] == "差し追込":
             base_mod -= 0.5
             horse['special_flag'] = "✨大井差し警戒"
 
-    # 馬体重変動と外枠の様子見ロジック
     last_race = past_df.iloc[0]
     weight_diff = horse['current_weight'] - last_race['weight']
     weight_modifier = weight_diff * 0.25
@@ -299,7 +285,6 @@ def fetch_real_data(_session, target_race_id: str):
             horse_name = bamei_a.text.strip()
             horse_url = "https://s.keibabook.co.jp" + bamei_a['href']
             
-            # ログイン済みのセッションを使って馬ページを取得
             past_races = fetch_horse_details(_session, horse_url, current_dist)
             current_weight = past_races[0]['weight'] if past_races else 480.0
             
@@ -320,7 +305,7 @@ def fetch_real_data(_session, target_race_id: str):
         return None, 1400, "", "ダート", f"エラー: {e}"
 
 # ==========================================
-# 3. スマホ対応UI
+# 3. スマホ対応UI & Secretsログイン処理
 # ==========================================
 st.set_page_config(page_title="AI南関展開予想", page_icon="🏇", layout="centered")
 
@@ -330,30 +315,55 @@ if 'kb_session' not in st.session_state:
 if 'is_logged_in' not in st.session_state:
     st.session_state.is_logged_in = False
 
+# Secretsから情報を取得（存在しない場合のエラーハンドリング）
+try:
+    secret_id = st.secrets["keibabook"]["login_id"]
+    secret_pw = st.secrets["keibabook"]["password"]
+    has_secrets = True
+except (KeyError, FileNotFoundError):
+    has_secrets = False
+
 with st.sidebar:
     st.header("🔑 競馬ブック ログイン")
+    
     if not st.session_state.is_logged_in:
-        kb_id = st.text_input("ログインID (メールアドレス等)")
-        kb_pw = st.text_input("パスワード", type="password")
-        if st.button("ログイン実行"):
-            with st.spinner("ログイン中..."):
-                session, success, msg = login_keibabook(kb_id, kb_pw)
-                if success:
-                    st.session_state.kb_session = session
-                    st.session_state.is_logged_in = True
-                    st.success(msg)
-                    st.rerun()
-                else:
-                    st.error(msg)
+        if has_secrets:
+            # Secretsに情報があればボタン一つでログイン
+            st.info("Secretsに認証情報が設定されています。")
+            if st.button("🔒 自動ログイン実行", type="primary"):
+                with st.spinner("ログイン中..."):
+                    session, success, msg = login_keibabook(secret_id, secret_pw)
+                    if success:
+                        st.session_state.kb_session = session
+                        st.session_state.is_logged_in = True
+                        st.success(msg)
+                        st.rerun()
+                    else:
+                        st.error(msg)
+        else:
+            # Secretsがない場合は手動入力を促すフォールバック
+            st.warning("Secretsが設定されていません。手動で入力してください。")
+            kb_id = st.text_input("ログインID (メールアドレス等)")
+            kb_pw = st.text_input("パスワード", type="password")
+            if st.button("ログイン実行"):
+                with st.spinner("ログイン中..."):
+                    session, success, msg = login_keibabook(kb_id, kb_pw)
+                    if success:
+                        st.session_state.kb_session = session
+                        st.session_state.is_logged_in = True
+                        st.success(msg)
+                        st.rerun()
+                    else:
+                        st.error(msg)
     else:
-        st.success("ログイン済みです")
+        st.success("ログイン済みです ✅")
         if st.button("ログアウト"):
             st.session_state.kb_session = requests.Session()
             st.session_state.is_logged_in = False
             st.rerun()
 
 st.title("🏇 AI競馬展開予想 (南関特化版)")
-st.markdown("大井の白砂補正や、浦和・川崎の強い前残りバイアスを加味した隊列予想を行います。※プレミアムデータを取得するため、サイドバーからのログインを推奨します。")
+st.markdown("大井の白砂補正や、浦和・川崎の強い前残りバイアスを加味した隊列予想を行います。※プレミアムデータを取得するため、サイドバーからのログインが必要です。")
 
 with st.container(border=True):
     st.subheader("⚙️ レース設定")
@@ -369,9 +379,12 @@ with st.container(border=True):
 
     col1, col2 = st.columns(2)
     with col1:
-        execute_btn = st.button("🚀 選択レースを予想", type="primary", use_container_width=True)
+        execute_btn = st.button("🚀 選択レースを予想", type="primary", use_container_width=True, disabled=not st.session_state.is_logged_in)
     with col2:
-        execute_all_btn = st.button("🌟 全12Rを一括予想", type="secondary", use_container_width=True)
+        execute_all_btn = st.button("🌟 全12Rを一括予想", type="secondary", use_container_width=True, disabled=not st.session_state.is_logged_in)
+        
+    if not st.session_state.is_logged_in:
+        st.error("⚠️ 左のサイドバーから競馬ブックにログインしてください。")
 
 run_inference = False
 target_races = []
@@ -402,7 +415,6 @@ if run_inference:
             st.markdown(f"### 🏁 {race_num}R")
             
             with st.spinner(f"{race_num}R の各馬の詳細データを解析中..."):
-                # セッションを渡してスクレイピング実行
                 horses, current_dist, current_venue, current_track, error_msg = fetch_real_data(st.session_state.kb_session, target_race_id)
                 
                 if error_msg:
